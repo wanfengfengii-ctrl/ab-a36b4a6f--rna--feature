@@ -10,6 +10,9 @@ passes.  The checks cover the acceptance contract:
 * two-level scoring (pairs, then adjacent stacked pairs);
 * dot-bracket / pair-table consistency and every structural legality rule;
 * forced/forbidden constraint satisfaction;
+* exact ensemble counting: constrained totals, per-position distributions,
+  distribution conservation, decimal-string counts, cross-checked against
+  an independent brute-force enumeration;
 * rejection of malformed input with HTTP 422 before any solving happens.
 
 Run locally:  python -m acceptance.run
@@ -22,11 +25,13 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 
 import httpx
 
 API_BASE = os.environ.get("RNA_API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 FOLD_PATH = "/api/v1/fold"
+ENSEMBLE_PATH = "/api/v1/fold/ensemble"
 TIMEOUT = float(os.environ.get("RNA_API_TIMEOUT", "15"))
 
 # Bases that may pair with each other.
@@ -45,6 +50,40 @@ ORDER = {"(": 0, ".": 1, ")": 2}
 
 def bracket_key(structure: str) -> tuple[int, ...]:
     return tuple(ORDER[c] for c in structure)
+
+
+def enumerate_structures(
+    sequence: str, forced: frozenset[int], forbidden: frozenset[int]
+) -> tuple[frozenset, ...]:
+    """Reference enumeration of every legal structure (sets of (i, j) pairs).
+
+    Independent of the service implementation; used to cross-check the
+    ensemble endpoint's exact counts on small instances.
+    """
+    n = len(sequence)
+    partners: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        if i in forbidden:
+            continue
+        for r in range(i + MIN_PAIR_DISTANCE, n):
+            if r not in forbidden and (sequence[i], sequence[r]) in ALLOWED_PAIRS:
+                partners[i].append(r)
+
+    @lru_cache(maxsize=None)
+    def gen(i: int, j: int) -> tuple[frozenset, ...]:
+        if i >= j:
+            return (frozenset(),)
+        out: list[frozenset] = []
+        if i not in forced:
+            out.extend(gen(i + 1, j))
+        for r in partners[i]:
+            if r < j:
+                for inside in gen(i + 1, r):
+                    for outside in gen(r + 1, j):
+                        out.append(inside | outside | {(i, r)})
+        return tuple(out)
+
+    return gen(0, n)
 
 
 @dataclass
@@ -174,6 +213,9 @@ class Acceptance:
 
     def fold(self, payload: dict) -> httpx.Response:
         return self.client.post(FOLD_PATH, json=payload)
+
+    def ensemble(self, payload: dict) -> httpx.Response:
+        return self.client.post(ENSEMBLE_PATH, json=payload)
 
     # -- individual checks -------------------------------------------------
 
@@ -351,6 +393,202 @@ class Acceptance:
                 f"{label}: expected 422 rejection, got {resp.status_code} {resp.text[:120]}",
             )
 
+    # -- ensemble counting checks ------------------------------------------
+
+    @staticmethod
+    def validate_distribution(dist: dict, total: int) -> None:
+        """Enforce the ensemble distribution contract for one position."""
+        expect_eq(set(dist.keys()), {"position", "unpaired", "pairs"}, "distribution fields")
+        expect(
+            isinstance(dist["unpaired"], str) and dist["unpaired"].isdigit(),
+            f"unpaired must be a decimal string, got {dist['unpaired']!r}",
+        )
+        partners = []
+        subtotal = int(dist["unpaired"])
+        for pair in dist["pairs"]:
+            expect_eq(set(pair.keys()), {"position", "count"}, "pair entry fields")
+            expect(
+                isinstance(pair["count"], str) and pair["count"].isdigit(),
+                f"pair count must be a decimal string, got {pair['count']!r}",
+            )
+            partners.append(pair["position"])
+            subtotal += int(pair["count"])
+        expect_eq(partners, sorted(partners), "pair entries sorted ascending")
+        expect_eq(
+            subtotal, total,
+            f"distribution conservation for position {dist['position']}",
+        )
+
+    def check_ensemble_basic_count(self) -> None:
+        seq = "G" + "A" * 18 + "C"
+        resp = self.ensemble({"sequence": seq, "positions": [0, 5, 19]})
+        expect_eq(resp.status_code, 200, "status")
+        body = resp.json()
+        expect_eq(body["sequence"], seq, "echoed sequence")
+        expect_eq(body["length"], 20, "length")
+        expect_eq(body["total"], "2", "total count")
+        positions = body["positions"]
+        expect_eq([p["position"] for p in positions], [0, 5, 19], "echoed positions")
+        # Exactly two structures: all-unpaired and {(0, 19)}.
+        expect_eq(positions[0], {"position": 0, "unpaired": "1",
+                                 "pairs": [{"position": 19, "count": "1"}]},
+                  "distribution for position 0")
+        expect_eq(positions[1], {"position": 5, "unpaired": "2", "pairs": []},
+                  "distribution for position 5")
+        expect_eq(positions[2], {"position": 19, "unpaired": "1",
+                                 "pairs": [{"position": 0, "count": "1"}]},
+                  "distribution for position 19")
+
+    def check_ensemble_constrained_count(self) -> None:
+        # Legal pairs (0,6),(0,7),(1,6),(1,7) give six non-crossing structures.
+        seq = "GGAAAACC" + "A" * 12
+        resp = self.ensemble({"sequence": seq, "positions": [0, 1, 6, 7]})
+        expect_eq(resp.status_code, 200, "status")
+        body = resp.json()
+        expect_eq(body["total"], "6", "total count")
+        by_pos = {p["position"]: p for p in body["positions"]}
+        expect_eq(by_pos[0], {"position": 0, "unpaired": "3", "pairs": [
+            {"position": 6, "count": "1"}, {"position": 7, "count": "2"}]},
+            "distribution for position 0")
+        expect_eq(by_pos[7], {"position": 7, "unpaired": "3", "pairs": [
+            {"position": 0, "count": "2"}, {"position": 1, "count": "1"}]},
+            "distribution for position 7")
+        for dist in body["positions"]:
+            self.validate_distribution(dist, 6)
+
+    def check_ensemble_forced_constraint(self) -> None:
+        seq = "GGAAAACC" + "A" * 12
+        resp = self.ensemble({"sequence": seq, "forced_positions": [0],
+                              "positions": [0, 1]})
+        expect_eq(resp.status_code, 200, "status")
+        body = resp.json()
+        # Only structures with 0 paired: {(0,6)}, {(0,7)}, {(0,7),(1,6)}.
+        expect_eq(body["total"], "3", "total count")
+        first = body["positions"][0]
+        expect_eq(first["unpaired"], "0", "forced position never unpaired")
+        expect_eq(first["pairs"], [{"position": 6, "count": "1"},
+                                   {"position": 7, "count": "2"}],
+                  "forced position partners")
+        for dist in body["positions"]:
+            self.validate_distribution(dist, 3)
+
+    def check_ensemble_forbidden_constraint(self) -> None:
+        seq = "GGAAAACC" + "A" * 12
+        resp = self.ensemble({"sequence": seq, "forbidden_positions": [7],
+                              "positions": [7, 0]})
+        expect_eq(resp.status_code, 200, "status")
+        body = resp.json()
+        # Pairs into 7 removed: {}, {(0,6)}, {(1,6)}.
+        expect_eq(body["total"], "3", "total count")
+        forbidden, opener = body["positions"]
+        expect_eq(forbidden, {"position": 7, "unpaired": "3", "pairs": []},
+                  "forbidden position distribution")
+        expect_eq(opener["pairs"], [{"position": 6, "count": "1"}],
+                  "forbidden partner not listed")
+        for dist in body["positions"]:
+            self.validate_distribution(dist, 3)
+
+    def check_ensemble_infeasible(self) -> None:
+        resp = self.ensemble({"sequence": "A" * 20, "forced_positions": [0],
+                              "positions": [0, 5, 19]})
+        expect_eq(resp.status_code, 200, "status")
+        body = resp.json()
+        expect_eq(body["total"], "0", "total count")
+        expect_eq(body["positions"], [
+            {"position": 0, "unpaired": "0", "pairs": []},
+            {"position": 5, "unpaired": "0", "pairs": []},
+            {"position": 19, "unpaired": "0", "pairs": []},
+        ], "empty distributions on infeasible")
+
+    def check_ensemble_brute_force_crosscheck(self) -> None:
+        seq = "AUGCAUGCAUGCAUGCAUGC"
+        forced = frozenset({3})
+        forbidden = frozenset({16})
+        positions = [0, 3, 8, 16, 19]
+        structures = enumerate_structures(seq, forced, forbidden)
+        expect(0 < len(structures) < 100000, "fixture should stay enumerable")
+        resp = self.ensemble({"sequence": seq, "forced_positions": [3],
+                              "forbidden_positions": [16], "positions": positions})
+        expect_eq(resp.status_code, 200, "status")
+        body = resp.json()
+        total = len(structures)
+        expect_eq(body["total"], str(total), "total vs brute-force enumeration")
+        expect(isinstance(body["total"], str), "total must be a decimal string")
+        for dist in body["positions"]:
+            p = dist["position"]
+            exp_unpaired = sum(
+                1 for s in structures if all(p not in pair for pair in s)
+            )
+            expect_eq(int(dist["unpaired"]), exp_unpaired,
+                      f"unpaired count for position {p}")
+            exp_pairs: dict[int, int] = {}
+            for s in structures:
+                for a, b in s:
+                    if a == p:
+                        exp_pairs[b] = exp_pairs.get(b, 0) + 1
+                    elif b == p:
+                        exp_pairs[a] = exp_pairs.get(a, 0) + 1
+            for pair in dist["pairs"]:
+                expect_eq(int(pair["count"]), exp_pairs.get(pair["position"], 0),
+                          f"pair count ({p},{pair['position']})")
+            self.validate_distribution(dist, total)
+
+    def check_ensemble_max_length(self) -> None:
+        seq = "GC" * 60
+        positions = list(range(12))
+        start = time.perf_counter()
+        resp = self.ensemble({"sequence": seq, "positions": positions})
+        elapsed = time.perf_counter() - start
+        expect_eq(resp.status_code, 200, "status")
+        expect(elapsed < 10.0, f"n=120 ensemble count took {elapsed:.2f}s (>10s)")
+        body = resp.json()
+        expect_eq(body["length"], 120, "length")
+        total = int(body["total"])
+        expect(total > 0, "dense sequence must have legal structures")
+        for dist in body["positions"]:
+            self.validate_distribution(dist, total)
+        print(f"\n    n=120 ensemble count: {elapsed * 1000:.1f} ms "
+              f"({len(body['total'])}-digit total)")
+
+    def check_ensemble_determinism(self) -> None:
+        payload = {"sequence": "AUGCAUGCAUGCAUGCAUGCAUGC",
+                   "forced_positions": [1, 5], "forbidden_positions": [10],
+                   "positions": [0, 3, 7, 11]}
+        first = self.ensemble(payload).json()
+        second = self.ensemble(payload).json()
+        expect_eq(first, second, "identical requests must yield identical counts")
+
+    def check_ensemble_rejections(self) -> None:
+        bad_payloads = [
+            ("length below mode minimum", {"sequence": "A" * 19, "positions": [0]}),
+            ("length above mode maximum", {"sequence": "A" * 121, "positions": [0]}),
+            ("adjudication-only length", {"sequence": "A" * 240, "positions": [0]}),
+            ("illegal base", {"sequence": "N" + "A" * 19, "positions": [0]}),
+            ("no positions", {"sequence": "A" * 20, "positions": []}),
+            ("positions missing", {"sequence": "A" * 20}),
+            ("too many positions",
+             {"sequence": "A" * 20, "positions": list(range(13))}),
+            ("duplicate positions", {"sequence": "A" * 20, "positions": [3, 7, 3]}),
+            ("position out of range", {"sequence": "A" * 20, "positions": [20]}),
+            ("negative position", {"sequence": "A" * 20, "positions": [-1]}),
+            ("position wrong type", {"sequence": "A" * 20, "positions": ["3"]}),
+            ("forced out of range",
+             {"sequence": "A" * 20, "positions": [0], "forced_positions": [20]}),
+            ("forbidden negative",
+             {"sequence": "A" * 20, "positions": [0], "forbidden_positions": [-1]}),
+            ("unknown field",
+             {"sequence": "A" * 20, "positions": [0], "extra": 1}),
+        ]
+        for label, payload in bad_payloads:
+            resp = self.ensemble(payload)
+            expect(
+                resp.status_code == 422,
+                f"{label}: expected 422 rejection, got {resp.status_code} {resp.text[:120]}",
+            )
+        resp = self.client.get(ENSEMBLE_PATH)
+        expect(resp.status_code == 405,
+               f"GET on ensemble endpoint should be 405, got {resp.status_code}")
+
     def run(self) -> list[CheckResult]:
         checks = [
             ("health endpoint", self.check_health),
@@ -369,6 +607,15 @@ class Acceptance:
             ("deterministic repeated verdicts", self.check_determinism),
             ("n=240 performance", self.check_max_length_performance),
             ("illegal input never reaches solver", self.check_rejections),
+            ("ensemble basic count", self.check_ensemble_basic_count),
+            ("ensemble constrained count", self.check_ensemble_constrained_count),
+            ("ensemble forced constraint", self.check_ensemble_forced_constraint),
+            ("ensemble forbidden constraint", self.check_ensemble_forbidden_constraint),
+            ("ensemble infeasible yields zero", self.check_ensemble_infeasible),
+            ("ensemble brute-force crosscheck", self.check_ensemble_brute_force_crosscheck),
+            ("ensemble n=120 performance", self.check_ensemble_max_length),
+            ("ensemble deterministic repeats", self.check_ensemble_determinism),
+            ("ensemble illegal input rejected", self.check_ensemble_rejections),
         ]
         results: list[CheckResult] = []
         for name, fn in checks:
@@ -385,7 +632,7 @@ class Acceptance:
 
 def main() -> int:
     print(f"RNA folding adjudication acceptance suite")
-    print(f"Target: {API_BASE}{FOLD_PATH}\n")
+    print(f"Target: {API_BASE} ({FOLD_PATH}, {ENSEMBLE_PATH})\n")
     acceptance = Acceptance()
     try:
         results = acceptance.run()

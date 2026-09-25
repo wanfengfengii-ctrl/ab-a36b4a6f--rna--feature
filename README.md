@@ -78,6 +78,42 @@
 }
 ```
 
+### `POST /api/v1/fold/ensemble`
+
+系综计数：在**不枚举结构**的前提下，用 inside/outside 动态规划精确统计满足全部合法性规则
+（碱基类型、最小间隔、无伪结、强制/禁止位置约束）的结构总数，并给出每个待复核位置的配对分布，
+用于识别稳定暴露或仅与少数位点配对的核苷酸。
+
+请求：与裁决接口相同的 `sequence` / `forced_positions` / `forbidden_positions`
+（本模式序列长度限 **20–120**），外加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `positions` | integer[] | 必填，1–12 个 0 基待复核位置，不得重复 |
+
+响应（所有计数以十进制字符串表达）：
+
+```json
+{
+  "sequence": "GGAAAACCAAAAAAAAAAAA",
+  "length": 20,
+  "total": "6",
+  "positions": [
+    {"position": 0, "unpaired": "3",
+     "pairs": [{"position": 6, "count": "1"}, {"position": 7, "count": "2"}]},
+    {"position": 7, "unpaired": "3",
+     "pairs": [{"position": 0, "count": "2"}, {"position": 1, "count": "1"}]}
+  ]
+}
+```
+
+- `positions` 按请求顺序回显；每个位置的 `pairs` 覆盖全部合法配对位点，按配对位置升序排列；
+- 守恒性：每个位置的 `unpaired` 与全部 `pairs[].count` 之和恒等于 `total`；
+- 无可行结构时 `total` 为 `"0"`，每个位置返回空分布（`unpaired: "0"`、`pairs: []`）；
+- 非法位置、重复待复核位置、待复核位置数量超出 1–12、序列长度超出 20–120 等输入
+  一律在进入求解前以 **HTTP 422** 拒绝；
+- 相同请求的结果完全一致（纯函数计数，无任何随机性）。
+
 ## 运行（Docker）
 
 ```bash
@@ -90,9 +126,10 @@ RNA_API_PORT=9090 docker compose up --build
 
 - API：`http://localhost:${RNA_API_PORT:-8000}`，OpenAPI 文档位于 `/docs`；
 - `api` 服务带容器健康检查（轮询 `/health`）；
-- `acceptance` 为一次性服务，等待 API 健康后执行 15 项端到端黑盒检查并退出，
+- `acceptance` 为一次性服务，等待 API 健康后执行 24 项端到端黑盒检查并退出，
   包含健康检查、唯一/多解/不可行裁决、字符序选择、两级得分、全部结构合法性、
-  约束满足、确定性、n=240 性能以及 12 类非法输入的 422 拒绝。
+  约束满足、确定性、n=240 性能、非法输入的 422 拒绝（普通裁决回归），以及系综计数的
+  受限计数、强制/禁止约束、分布守恒、暴力枚举交叉校验、n=120 性能与非法输入拒绝。
 
 仅运行验收（API 已在 compose 网络中）：
 
@@ -114,9 +151,9 @@ python -m acceptance.run                 # 对运行中的 API 执行一次性�
 ## 目录结构
 
 ```
-app/            FastAPI 应用、请求/响应模式、区间 DP 求解器
+app/            FastAPI 应用、请求/响应模式、区间 DP 求解器、系综计数 DP
 acceptance/     一次性黑盒验收服务
-tests/          求解器单元测试（含暴力枚举交叉校验）与 HTTP 测试
+tests/          求解器与系综计数单元测试（含暴力枚举交叉校验）与 HTTP 测试
 Dockerfile      python:3.13-slim 单一镜像（API 与验收共用）
 docker-compose.yml
 ```

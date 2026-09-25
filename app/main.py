@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.schemas import FoldRequest, FoldResponse, Score, StructureView
+from app.ensemble import count_ensemble
+from app.schemas import (
+    EnsembleRequest,
+    EnsembleResponse,
+    FoldRequest,
+    FoldResponse,
+    PairCount,
+    PositionDistribution,
+    Score,
+    StructureView,
+)
 from app.solver import adjudicate, pairs_from_structure
 
 app = FastAPI(
@@ -12,7 +22,8 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Deterministic adjudication of candidate RNA secondary structures via "
-        "interval dynamic programming (maximize pairs, then stacked pairs)."
+        "interval dynamic programming (maximize pairs, then stacked pairs), "
+        "plus exact ensemble counting over all legal structures."
     ),
 )
 
@@ -55,4 +66,33 @@ def fold(request: FoldRequest) -> FoldResponse:
         unique=verdict.witness is None,
         primary=view(verdict.primary),
         witness=view(verdict.witness) if verdict.witness is not None else None,
+    )
+
+
+@app.post(
+    "/api/v1/fold/ensemble", response_model=EnsembleResponse, tags=["ensemble"]
+)
+def fold_ensemble(request: EnsembleRequest) -> EnsembleResponse:
+    """Count every legal structure and report per-position distributions."""
+    counts = count_ensemble(
+        request.sequence,
+        forced_positions=request.forced_positions,
+        forbidden_positions=request.forbidden_positions,
+        positions=request.positions,
+    )
+    return EnsembleResponse(
+        sequence=request.sequence,
+        length=len(request.sequence),
+        total=str(counts.total),
+        positions=[
+            PositionDistribution(
+                position=dist.position,
+                unpaired=str(dist.unpaired),
+                pairs=[
+                    PairCount(position=partner, count=str(count))
+                    for partner, count in dist.pairs
+                ],
+            )
+            for dist in counts.distributions
+        ],
     )
