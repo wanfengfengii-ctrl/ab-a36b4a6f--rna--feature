@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.schemas import FoldRequest, FoldResponse, Score, StructureView
+from app.ensemble import count_ensemble
+from app.schemas import (
+    EnsembleRequest,
+    EnsembleResponse,
+    FoldRequest,
+    FoldResponse,
+    PartnerCount,
+    PositionDistribution,
+    Score,
+    StructureView,
+)
 from app.solver import adjudicate, pairs_from_structure
 
 app = FastAPI(
@@ -55,4 +65,32 @@ def fold(request: FoldRequest) -> FoldResponse:
         unique=verdict.witness is None,
         primary=view(verdict.primary),
         witness=view(verdict.witness) if verdict.witness is not None else None,
+    )
+
+
+@app.post("/api/v1/fold/ensemble", response_model=EnsembleResponse, tags=["ensemble"])
+def fold_ensemble(request: EnsembleRequest) -> EnsembleResponse:
+    """Count all legal structures and per-position pairing distributions."""
+    result = count_ensemble(
+        request.sequence,
+        forced_positions=request.forced_positions,
+        forbidden_positions=request.forbidden_positions,
+        positions=request.positions,
+    )
+    return EnsembleResponse(
+        status="FEASIBLE" if result.total > 0 else "INFEASIBLE",
+        sequence=request.sequence,
+        length=len(request.sequence),
+        total=str(result.total),
+        positions=[
+            PositionDistribution(
+                position=dist.position,
+                unpaired=str(dist.unpaired),
+                partners=[
+                    PartnerCount(position=partner, count=str(count))
+                    for partner, count in dist.partners
+                ],
+            )
+            for dist in result.distributions
+        ],
     )
