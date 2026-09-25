@@ -1,0 +1,36 @@
+# RNA folding adjudication stack:
+#   * api        - long-running FastAPI service with a health check
+#   * acceptance - one-shot verification job (exits 0 on pass, 1 on failure)
+#
+# Usage:
+#   docker compose up --build            # start API, run the one-shot job, exit
+#   RNA_API_PORT=9090 docker compose up   # API on a configurable host port
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rna-folding-adjudication:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${RNA_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if r.status==200 and json.load(r)['status']=='ok' else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  acceptance:
+    image: rna-folding-adjudication:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "acceptance.run"]
+    environment:
+      RNA_API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
